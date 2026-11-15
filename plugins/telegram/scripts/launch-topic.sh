@@ -90,45 +90,123 @@ TG_PATH="$PATH"
 # pane cannot answer its interactive multiple-choice UI. NB the =form is
 # required (variadic, like --channels), and the disallowedTools SETTINGS key
 # does NOT work for it - only the CLI flag does.
-# `exec` so the pane dies with claude and the proxy's reconcile drops it.
+# `exec` so the pane dies with claude and the proxy's reconcile drops it - EXCEPT
+# on the self-heal retry path below, which needs the exit code first.
 #
 # Session continuity: a FIRST spawn uses --session-id <id> + the kickoff; a
 # re-spawn (TG_RESUME=1) uses --resume <id> and NO kickoff. TG_MODEL is the
 # --model FLAG (a settings `model` is ignored by a --resume'd session; the flag
 # overrides even on resume). Args built with `set --` so a bracketed id like
 # claude-fable-5[1m] stays ONE properly-quoted arg.
+#
+# SELF-HEAL (2026-08-31 incident: topic 253 "Zensical auto index hook"): the
+# FIRST spawn can crash before claude ever writes the session's transcript
+# (root cause turned out to be the TRUST DIALOG KEYBINDING bug documented
+# below - but ANY early-crash cause hits this same dead end). Every later
+# respawn is then TG_RESUME=1 forever (proxy.ts sets it once
+# st.claudeSessionId exists) and --resume fails with "No conversation found
+# ..." every single time, so the topic never recovers on its own. Fix: on
+# that specific error, re-mint with --session-id (same id, so the registry
+# stays consistent) + the kickoff - identical to a genuine first spawn. Any
+# OTHER --resume failure (crash mid real conversation, network blip, etc.)
+# must NOT re-mint - that would nuke a transcript with real history - so
+# it's gated on the exact error text.
+# NB: under a real pty (this IS one - it is the tmux/herdr pane), interactive
+# claude renders this error through its TUI to STDOUT, not as a plain stderr
+# line (confirmed by hand: piping stderr alone to a file, as a first attempt
+# here did, caught nothing and the self-heal silently never fired - a
+# non-tty test of the same command DID get a plain stderr line, which is
+# what misled that first attempt). So this reads back the rendered SCREEN via
+# `tmux capture-pane` after exit instead of redirecting a stream - the same
+# technique the dialog watchers below use - rather than touching stdout/
+# stderr, which would break real interactive rendering on the success path.
 PANE_CMD='export PATH="$TG_PATH"; \
  set -- --dangerously-load-development-channels="$TG_MARKETPLACE" \
         --settings "$TG_SETTINGS" --permission-mode auto \
         --disallowedTools=AskUserQuestion; \
  [ -n "$TG_MODEL" ] && set -- "$@" --model "$TG_MODEL"; \
  if [ -n "$TG_RESUME" ]; then \
-   exec "$TG_CLAUDE_BIN" "$@" --resume "$TG_CLAUDE_SESSION_ID"; \
+   "$TG_CLAUDE_BIN" "$@" --resume "$TG_CLAUDE_SESSION_ID"; \
+   TG_RESUME_CODE=$?; \
+   if [ "$TG_RESUME_CODE" -ne 0 ]; then \
+     TG_RESUME_SCREEN=$(tmux capture-pane -t "$TG_SESSION" -p 2>/dev/null | tr -d " \t\n"); \
+     if printf "%s" "$TG_RESUME_SCREEN" | grep -q "NoconversationfoundwithsessionID"; then \
+       exec "$TG_CLAUDE_BIN" "$@" --session-id "$TG_CLAUDE_SESSION_ID" "$TG_KICKOFF"; \
+     fi; \
+   fi; \
+   exit "$TG_RESUME_CODE"; \
  else \
    exec "$TG_CLAUDE_BIN" "$@" --session-id "$TG_CLAUDE_SESSION_ID" "$TG_KICKOFF"; \
  fi'
 
-# --dangerously-load-development-channels can show a one-key "local
-# development" confirmation dialog (third-party channel plugins are not
-# first-party-approved, and allowedChannelPlugins is only honored in managed
-# settings). A detached pane has no one to answer it, so each backend runs a
-# short-lived DETACHED watcher: poll the pane text for the dialog, send
-# "1"+Enter when it appears, then exit. The watcher's fds are detached so the
-# proxy's synchronous spawn returns at once.
-# WATCHER WINDOW: 2 minutes (480 x 0.25s). A BIG-transcript --resume renders
-# the dialog long after spawn (the transcript loads first); the original 15s
-# window lost that race twice (2026-07-17/18: sessions came up REPL-alive but
-# plugin-less, with messages queueing undrained at the proxy). The dialog does
-# not appear on every boot (claude >= 2.1.214 often skips it), so most
-# watchers just poll quietly and exit.
+# TWO one-key dialogs can block a fresh pane, and each watcher must clear BOTH:
+#   1. Claude Code's own "trust this folder" prompt - fires on the FIRST EVER
+#      claude invocation in a given TG_SPAWN_DIR (trust is remembered per
+#      directory, not per session, so this is normally a one-time cost for the
+#      lifetime of that spawn dir, not a per-topic or per-resume one).
+#   2. --dangerously-load-development-channels' "local development"
+#      confirmation (third-party channel plugins are not first-party-approved,
+#      and allowedChannelPlugins is only honored in managed settings).
+# The trust dialog renders FIRST (before any channel loading), so on a spawn-dir's
+# very first topic-Claude ever it blocks dialog 2 from even appearing - which
+# silently defeated the original single-dialog watcher (2026-07-30: it timed out
+# waiting for dialog 2 while dialog 1 sat unanswered in front of it, leaving the
+# session parked forever with the inbound message queued undrained at the proxy).
+# A detached pane has no one to answer either one, so each backend runs a
+# short-lived DETACHED watcher: poll the pane text, send "1"+Enter for whichever
+# dialog is showing (each tracked with its own once-only flag so a redraw lag
+# right after sending keys can't double-submit into whatever screen comes next),
+# and exit once both are cleared or the window runs out. The watcher's fds are
+# detached so the proxy's synchronous spawn returns at once.
+# WATCHER WINDOW: 2 minutes (480 x 0.25s) shared across both dialogs. A
+# BIG-transcript --resume can render dialog 2 long after spawn (the transcript
+# loads first); the original 15s window lost that race twice (2026-07-17/18:
+# sessions came up REPL-alive but plugin-less, with messages queueing undrained
+# at the proxy). Neither dialog appears on every boot (claude >= 2.1.214 often
+# skips dialog 2; a trusted spawn dir skips dialog 1), so most watchers just
+# poll quietly and exit.
 # WRAP-PROOF MATCHING: in a NARROW pane the dialog text wraps mid-phrase
 # ("for local\n       development"), so a plain grep for "local development"
 # never matches at ANY window length (this silently defeated the herdr watcher,
 # 2026-07-18). Each watcher therefore strips ALL whitespace (and, for the herdr
 # socket path, JSON-encoded \n sequences) from the captured text and greps for
 # the squashed phrase - immune to wrapping and indentation.
+#
+# TRUST DIALOG KEYBINDING (2026-08-31 incident: topic 253 "Zensical auto index
+# hook" wedged permanently). The trust dialog used to be a numbered menu, where
+# "1" + Enter picked "yes, trust it". A Claude Code update changed it to an
+# arrow-selected list defaulting to "No, exit" (confirmed by hand: `claude` in
+# a fresh untrusted dir shows "No, exit" pre-highlighted; only Down + Enter
+# reaches "Yes, I trust this folder"). The watcher still sent "1" Enter, which
+# is a no-op keystroke followed by Enter on the default "No, exit" - so every
+# spawn into a not-yet-trusted dir silently declined and exited status 1,
+# forever (a --resume of that dead session then fails with "No conversation
+# found", which is what surfaced first - the real bug is here, not there).
+# The dev-channel dialog right after it (DIALOG_SQUASHED) is UNCHANGED - still
+# a numbered menu with "1. I am using this for local development" as the
+# pre-highlighted default - so its "1" Enter below is still correct.
+#
+# HIGHLIGHT-AWARE TRUST ANSWER (2026-10-10 incident: topic 563 "Camp map" died
+# on every spawn). Two things broke the one-shot Down+Enter above:
+#   a. Trust for the HOME dir is never persisted, so with TG_SPAWN_DIR=$HOME the
+#      trust dialog shows on EVERY claude launch - including the self-heal
+#      re-exec below a failed --resume. The old once-only flag had already
+#      fired for the first launch, so the second dialog sat unanswered.
+#   b. The proxy's stuck-dialog scanner answers the same dialog independently.
+#      Down WRAPS in this 2-item list (confirmed by hand), so both sending
+#      Down+Enter = Down,Down,Enter = "No, exit" - claude quits before writing
+#      a transcript, and every later --resume hits (a).
+# So: never press Enter unless "Yes" is the highlighted row; otherwise press
+# Down once and re-read. Concurrent answerers converge instead of cancelling
+# out, and the watcher keeps watching for the whole window (bailing early only
+# once the pane is gone) so a re-shown dialog is answered too. WATCHER_SETTLE
+# gives an answered dialog time to disappear before the next read, so a
+# lingering redraw can't get a second "1" Enter typed into the REPL.
+TRUST_SQUASHED='Isthisaprojectyoucreatedoroneyoutrust'
+TRUST_YES_SELECTED='❯Yes,Itrustthisfolder'
 DIALOG_SQUASHED='Iamusingthisforlocaldevelopment'
 WATCHER_TRIES=480
+WATCHER_SETTLE=1.5
 
 spawn_tmux() {
   # Dedup: never spawn a second session for a topic. The '=' forces an EXACT
@@ -166,9 +244,22 @@ spawn_tmux() {
   # session name already resolves exactly, so pass the bare name.
   (
     for _ in $(seq 1 "$WATCHER_TRIES"); do
-      if tmux capture-pane -t "$TG_SESSION" -p 2>/dev/null | tr -d ' \t\n' | grep -q "$DIALOG_SQUASHED"; then
+      tmux has-session -t "=$TG_SESSION" 2>/dev/null || break
+      pane_text=$(tmux capture-pane -t "$TG_SESSION" -p 2>/dev/null | tr -d ' \t\n')
+      if printf '%s' "$pane_text" | grep -q "$TRUST_SQUASHED"; then
+        if printf '%s' "$pane_text" | grep -qF "$TRUST_YES_SELECTED"; then
+          tmux send-keys -t "$TG_SESSION" Enter
+          sleep "$WATCHER_SETTLE"
+        else
+          tmux send-keys -t "$TG_SESSION" Down
+          sleep 0.5
+        fi
+        continue
+      fi
+      if printf '%s' "$pane_text" | grep -q "$DIALOG_SQUASHED"; then
         tmux send-keys -t "$TG_SESSION" 1 Enter
-        break
+        sleep "$WATCHER_SETTLE"
+        continue
       fi
       sleep 0.25
     done
@@ -267,19 +358,32 @@ print("absent")
   fi
 
   # Auto-confirm watcher: poll the pane's visible text over the socket API
-  # (newline-delimited JSON; pane.read requires source=visible), answer the
-  # dialog with send-keys, exit. Skipped if the pane_id could not be parsed -
-  # the session still runs; a human can answer the dialog via `herdr`.
+  # (newline-delimited JSON; pane.read requires source=visible), answer whichever
+  # dialog is showing with send-keys (both share this file's TRUST/DIALOG
+  # watcher design - see the comment above), exit. Skipped if the pane_id could
+  # not be parsed - the session still runs; a human can answer via `herdr`.
   if [ -n "$pane_id" ]; then
     (
       for _ in $(seq 1 "$WATCHER_TRIES"); do
         # sed strips JSON-encoded newlines (literal backslash-n) BEFORE the
         # space strip, so a phrase wrapped across pane lines squashes back
         # together; see the wrap-proof matching note above.
-        if printf '{"id":"w","method":"pane.read","params":{"pane_id":"%s","source":"visible"}}\n' "$pane_id" \
-          | nc -U "$sock" 2>/dev/null | sed 's/\\n//g; s/ //g' | grep -q "$DIALOG_SQUASHED"; then
+        pane_text=$(printf '{"id":"w","method":"pane.read","params":{"pane_id":"%s","source":"visible"}}\n' "$pane_id" \
+          | nc -U "$sock" 2>/dev/null | sed 's/\\n//g; s/ //g')
+        if printf '%s' "$pane_text" | grep -q "$TRUST_SQUASHED"; then
+          if printf '%s' "$pane_text" | grep -qF "$TRUST_YES_SELECTED"; then
+            "$herdr_bin" pane send-keys "$pane_id" Enter
+            sleep "$WATCHER_SETTLE"
+          else
+            "$herdr_bin" pane send-keys "$pane_id" Down
+            sleep 0.5
+          fi
+          continue
+        fi
+        if printf '%s' "$pane_text" | grep -q "$DIALOG_SQUASHED"; then
           "$herdr_bin" pane send-keys "$pane_id" 1 Enter
-          break
+          sleep "$WATCHER_SETTLE"
+          continue
         fi
         sleep 0.25
       done
