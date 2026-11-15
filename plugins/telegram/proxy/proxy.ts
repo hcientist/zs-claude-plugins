@@ -70,13 +70,18 @@ const ENV_FILES = [join(PLUGIN_ROOT, '.env'), join(STATE_DIR, '.env')]
 // ---- env -------------------------------------------------------------------
 
 // Load a .env into process.env WITHOUT overriding a value already in the real
-// environment. The token is a credential, so lock the file to the owner.
+// environment, and WITHOUT letting a blank `KEY=` line (every optional key in
+// the shipped .env.example template) clobber the code's own default below -
+// only a genuinely non-empty value counts as "set". The token is a
+// credential, so lock the file to the owner.
 function loadEnvFile(f: string): void {
   try {
     chmodSync(f, 0o600)
     for (const line of readFileSync(f, 'utf8').split('\n')) {
       const m = line.match(/^\s*(\w+)\s*=\s*(.*)$/)
-      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim()
+      if (!m) continue
+      const v = m[2].trim()
+      if (v !== '' && process.env[m[1]] === undefined) process.env[m[1]] = v
     }
   } catch {}
 }
@@ -551,6 +556,13 @@ interface Multiplexer {
   readonly kind: 'tmux' | 'herdr'
   liveSessions(): Set<string>
   kill(session: string): boolean
+  // Rendered pane text (raw, not squashed) for a live session, or null if it
+  // cannot be read (session gone, backend error). Used by the stuck-dialog
+  // auto-clear scan below; NOT a general-purpose pane-reading API.
+  paneText(session: string): string | null
+  // Send a sequence of keys to a session's pane, one tmux-send-keys-style
+  // token per array element (e.g. ['Down'] or ['1', 'Enter']).
+  sendKeys(session: string, keys: string[]): void
 }
 
 class TmuxMux implements Multiplexer {
@@ -571,6 +583,15 @@ class TmuxMux implements Multiplexer {
     // '=' forces an exact-name match (claude-x-4 must not match claude-x-45).
     const r = spawnSync('tmux', ['kill-session', '-t', `=${session}`], { encoding: 'utf8' })
     return r.status === 0
+  }
+
+  paneText(session: string): string | null {
+    const r = spawnSync('tmux', ['capture-pane', '-p', '-t', session], { encoding: 'utf8' })
+    return r.status === 0 ? (r.stdout ?? '') : null
+  }
+
+  sendKeys(session: string, keys: string[]): void {
+    spawnSync('tmux', ['send-keys', '-t', session, ...keys], { encoding: 'utf8' })
   }
 }
 
@@ -630,6 +651,26 @@ class HerdrMux implements Multiplexer {
     if (!paneId) return false
     const r = spawnSync(this.bin, ['pane', 'close', paneId], { encoding: 'utf8' })
     return r.status === 0
+  }
+
+  // Mirrors launch-topic.sh's herdr watcher: read the pane over the socket API
+  // (pane.read, source=visible) rather than a CLI subcommand. Not squashed here
+  // (the scanner squashes) but JSON-encoded newlines ARE literal "\n" in the
+  // socket response, same wrap-proofing note as the bash watcher.
+  paneText(session: string): string | null {
+    const paneId = this.panes().get(session)?.paneId
+    if (!paneId) return null
+    const sock = process.env.HERDR_SOCKET_PATH ?? join(homedir(), '.config', 'herdr', 'herdr.sock')
+    const req = `{"id":"w","method":"pane.read","params":{"pane_id":"${paneId}","source":"visible"}}\n`
+    const r = spawnSync('nc', ['-U', sock], { input: req, encoding: 'utf8' })
+    if (r.status !== 0) return null
+    return (r.stdout ?? '').replace(/\\n/g, ' ')
+  }
+
+  sendKeys(session: string, keys: string[]): void {
+    const paneId = this.panes().get(session)?.paneId
+    if (!paneId) return
+    spawnSync(this.bin, ['pane', 'send-keys', paneId, ...keys], { encoding: 'utf8' })
   }
 }
 
@@ -1810,6 +1851,173 @@ async function pollWithRetry(): Promise<void> {
 
 await serveWithRetry()
 void pollWithRetry()
+
+// ---- stuck-dialog auto-clear (passive) --------------------------------------
+//
+// launch-topic.sh's own per-spawn watcher (a short-lived detached background
+// job) is meant to clear both one-key dialogs that can block a fresh pane -
+// see the big comment above spawn_tmux() there for the two dialogs and why
+// each needs answering. That watcher is disposable and silent: if it dies
+// early (e.g. reaped along with its parent shell - observed 2026-09-07
+// re-spawning topic 311 "AuditionEar" by hand from a sandboxed shell) or
+// simply loses the timing race, the topic is left parked on a dialog with NO
+// trace of why, discoverable only by someone happening to attach and look.
+//
+// This is a second, INDEPENDENT line of defense that lives in the proxy
+// itself (a stable long-running process, not a disposable spawn-time child):
+// periodically scan every topic's LIVE pane for either dialog's squashed text
+// and answer it the same way. Being centralized here means it also covers
+// spawns triggered by hand (as above) and does not depend on surviving
+// whatever process tree the spawn happened under.
+//
+// Squashing + the two phrases are duplicated from launch-topic.sh's
+// TRUST_SQUASHED / DIALOG_SQUASHED (keep both in sync - see that file for the
+// wrap-proof-matching and trust-dialog-keybinding history behind them).
+const TRUST_SQUASHED = 'isthisaprojectyoucreatedoroneyoutrust'
+const TRUST_YES_SELECTED = '❯yes,itrustthisfolder'
+const DIALOG_SQUASHED = 'iamusingthisforlocaldevelopment'
+const DIALOG_SCAN_MS = 5_000
+// A real trust/dev dialog is answered by ONE Down+Enter (or 1+Enter) - if that
+// doesn't clear it after a few tries, sending the same keys again blindly is
+// actively dangerous (an extra Down after "Yes" is already selected cycles a
+// 2-item list back to "No, exit", UNDOING a successful answer). Cap attempts
+// and fall back to a loud, repeated log instead of hammering the pane forever.
+const DIALOG_MAX_ATTEMPTS = 3
+const DIALOG_COOLDOWN_MS = 10_000
+
+type DialogWatchState = { trustAttempts: number; devAttempts: number; lastAttemptAt: number }
+const dialogState = new Map<string, DialogWatchState>() // keyed by session name
+
+function scanForStuckDialogs(): void {
+  const live = mux.liveSessions()
+  for (const [topic, st] of topics) {
+    if (!st.session || !live.has(st.session)) {
+      if (st.session) dialogState.delete(st.session)
+      continue
+    }
+    const text = mux.paneText(st.session)
+    if (text == null) continue
+    const squashed = text.replace(/\s+/g, '').toLowerCase()
+    const isTrust = squashed.includes(TRUST_SQUASHED)
+    const isDev = squashed.includes(DIALOG_SQUASHED)
+    if (!isTrust && !isDev) {
+      dialogState.delete(st.session)
+      continue
+    }
+    const state = dialogState.get(st.session) ?? { trustAttempts: 0, devAttempts: 0, lastAttemptAt: 0 }
+    const sinceLast = Date.now() - state.lastAttemptAt
+    if (sinceLast < DIALOG_COOLDOWN_MS) {
+      dialogState.set(st.session, state)
+      continue // give the last attempt time to render before judging it
+    }
+    if (isTrust) {
+      if (state.trustAttempts >= DIALOG_MAX_ATTEMPTS) {
+        log(
+          `WARNING: topic ${topic} "${st.name}" (${st.session}) still stuck on the trust dialog ` +
+            `after ${state.trustAttempts} auto-clear attempts - needs manual attention (tmux attach -t ${st.session})`,
+        )
+      } else {
+        // Highlight-aware, same as launch-topic.sh's watcher: Down wraps in this
+        // 2-item list, so a blind Down+Enter racing the watcher's own answer
+        // lands on "No, exit". Only Enter when Yes is the highlighted row.
+        mux.sendKeys(st.session, [squashed.includes(TRUST_YES_SELECTED) ? 'Enter' : 'Down'])
+        state.trustAttempts++
+        log(`auto-cleared trust dialog for topic ${topic} "${st.name}" (${st.session}), attempt ${state.trustAttempts}`)
+      }
+    } else {
+      if (state.devAttempts >= DIALOG_MAX_ATTEMPTS) {
+        log(
+          `WARNING: topic ${topic} "${st.name}" (${st.session}) still stuck on the dev-channels dialog ` +
+            `after ${state.devAttempts} auto-clear attempts - needs manual attention (tmux attach -t ${st.session})`,
+        )
+      } else {
+        mux.sendKeys(st.session, ['1', 'Enter'])
+        state.devAttempts++
+        log(`auto-cleared dev-channels dialog for topic ${topic} "${st.name}" (${st.session}), attempt ${state.devAttempts}`)
+      }
+    }
+    state.lastAttemptAt = Date.now()
+    dialogState.set(st.session, state)
+  }
+}
+setInterval(scanForStuckDialogs, DIALOG_SCAN_MS)
+log(`stuck-dialog auto-clear enabled: scanning every ${DIALOG_SCAN_MS / 1000}s`)
+
+// ---- health check: unexpected session death (passive) ----------------------
+//
+// ensureSession() already self-heals a topic whose recorded session died -
+// see its "stale recorded name" comment - but only reactively, when the NEXT
+// inbound message arrives. If a FIRST spawn crashes before claude ever writes
+// the transcript (2026-09-20 incident: topic 374 "Tandoor shopping to
+// iCloud" - the trigger that time was never pinned down, just a bad spawn),
+// the topic is left silently dead: st.session still names a tmux/herdr
+// session that no longer exists, and nothing prods ensureSession until the
+// user notices the silence and sends another message (or, that day, just
+// asks a human to look). This is a second, INDEPENDENT line of defense,
+// mirroring scanForStuckDialogs above: periodically scan every topic and
+// respawn/resume any whose session died without being asked to (a nightly
+// restart or a rate-limit failover always clears st.session via killSession
+// on the way out, so those never look like a crash here - only a session
+// that is still NAMED but no longer LIVE does).
+const HEALTH_CHECK_MS = 30_000
+const HEALTH_MAX_ATTEMPTS = 3
+const HEALTH_COOLDOWN_MS = 30_000
+
+type HealthState = { attempts: number; lastAttemptAt: number }
+const healthState = new Map<string, HealthState>() // keyed by topic
+
+function healthCheckSessions(): void {
+  const live = mux.liveSessions()
+  for (const [topic, st] of topics) {
+    if (SQUARE_TOPIC && topic === SQUARE_TOPIC) continue
+    if (!st.session || st.spawning) continue
+    if (live.has(st.session)) {
+      healthState.delete(topic)
+      continue
+    }
+    // Still booting (tmux session just created / herdr agent_status not yet
+    // "unknown" -> real): give it the same grace window ensureSession itself
+    // uses, so a normal spawn-in-progress is never mistaken for a crash.
+    if (st.spawnedAt > 0 && Date.now() - st.spawnedAt < SPAWN_GRACE_MS) continue
+    const state = healthState.get(topic) ?? { attempts: 0, lastAttemptAt: 0 }
+    if (Date.now() - state.lastAttemptAt < HEALTH_COOLDOWN_MS) continue
+    if (state.attempts >= HEALTH_MAX_ATTEMPTS) {
+      if (state.attempts === HEALTH_MAX_ATTEMPTS) {
+        log(
+          `WARNING: topic ${topic} "${st.name}" (${st.session}) failed to auto-recover after ` +
+            `${HEALTH_MAX_ATTEMPTS} attempts - needs manual attention`,
+        )
+        state.attempts++ // bump past the cap so this WARNING logs once, not every scan
+        healthState.set(topic, state)
+      }
+      continue
+    }
+    const label = st.name || topic
+    const deadSession = st.session
+    state.attempts++
+    state.lastAttemptAt = Date.now()
+    healthState.set(topic, state)
+    log(
+      `health check: topic ${topic} "${label}" session ${deadSession} died unexpectedly; ` +
+        `auto-recovering (attempt ${state.attempts}/${HEALTH_MAX_ATTEMPTS})`,
+    )
+    ensureSession(topic)
+    // Tell the operator IN the affected topic's thread, same reasoning as the
+    // rate-limit failover notice: the dead session cannot announce its own
+    // recovery, and a message that raced the crash may have been lost (queued
+    // for an MCP that never came up to drain it - see killSession's comment).
+    const tid = threadIdForTopic(topic)
+    bot.api
+      .sendMessage(
+        String(GROUP_CHAT_ID),
+        `⚠️ This topic's session crashed unexpectedly and has been auto-recovered. If your last message went unanswered, please resend it.`,
+        { ...(tid != null ? { message_thread_id: tid } : {}) },
+      )
+      .catch(e => log(`health check: recovery notice failed for topic ${topic}: ${e}`))
+  }
+}
+setInterval(healthCheckSessions, HEALTH_CHECK_MS)
+log(`health check enabled: scanning every ${HEALTH_CHECK_MS / 1000}s for unexpectedly dead topic sessions`)
 
 // ---- nightly restart (passive) ---------------------------------------------
 //
