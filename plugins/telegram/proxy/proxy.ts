@@ -466,6 +466,7 @@ function getTopic(topic: string): TopicState {
 
 function enqueue(topic: string, msg: InboundMsg): void {
   const st = getTopic(topic)
+  touchTopic(topic)
   const waiter = st.waiters.shift()
   if (waiter) waiter(msg)
   else st.queue.push(msg)
@@ -1574,6 +1575,7 @@ async function handleSend(req: Request): Promise<Response> {
   const chatId = String(b.chat_id)
   const topic = String(b.topic ?? 'general')
   const threadId = threadIdForTopic(topic)
+  touchTopic(topic)
   const text = String(b.text ?? '')
   const replyTo = b.reply_to != null ? Number(b.reply_to) : undefined
   const files: string[] = Array.isArray(b.files) ? b.files : []
@@ -2018,6 +2020,97 @@ function healthCheckSessions(): void {
 }
 setInterval(healthCheckSessions, HEALTH_CHECK_MS)
 log(`health check enabled: scanning every ${HEALTH_CHECK_MS / 1000}s for unexpectedly dead topic sessions`)
+
+// ---- idle reaper (passive) -------------------------------------------------
+//
+// If TELEGRAM_TOPICS_IDLE_REAP_HOURS is set (> 0, fractions allowed), every
+// REAP_SCAN_MS kill any live topic session that has been idle that long. Same
+// passive philosophy as the nightly restart: the proxy owns the Telegram poll,
+// so a topic-Claude only needs to be up while in use, and each one costs
+// ~0.3 GB (claude + its MCP) for as long as it lives. A reaped topic --resumes
+// the same conversation on its next inbound message.
+//
+// It MUST kill through killSession(), which clears st.session: the health
+// check treats a still-NAMED-but-dead session as a crash and respawns it
+// (posting "crashed unexpectedly" into the thread) - which is exactly what
+// happened when topics were shut down by hand from outside the proxy.
+//
+// "Idle" = the latest of: inbound message (enqueue, incl. square deliveries),
+// outbound reply (handleSend), spawn time, and the pane's own last OUTPUT
+// (tmux #{window_activity}). The pane signal is what keeps a Claude that is
+// busy on a long task without messaging anyone from being reaped: the TUI
+// redraws (spinner, tool output) the whole time it works, and goes static when
+// it is idle at the prompt. Under herdr, a `working`/`blocked` agent_status
+// counts as activity right now. Known gap: a Claude idle at the prompt while
+// it waits on a silent background task longer than the threshold is reaped
+// (its task notification is then lost) - keep the threshold generous.
+const IDLE_REAP_HOURS = Number(process.env.TELEGRAM_TOPICS_IDLE_REAP_HOURS ?? '')
+const REAP_SCAN_MS = 5 * 60_000
+// topic -> ms of the last inbound message / outbound reply. In-memory only: after
+// a proxy restart the pane-activity signal + spawnedAt carry the estimate.
+const lastTouch = new Map<string, number>()
+
+function touchTopic(topic: string): void {
+  lastTouch.set(topic, Date.now())
+}
+
+// ms timestamp of the session's last terminal activity, or null if unknown.
+function paneActivityMs(session: string): number | null {
+  if (mux.kind === 'tmux') {
+    // `session:` (trailing colon) = that session's current window; the `=`
+    // exact-match prefix is not accepted for window targets.
+    const r = spawnSync('tmux', ['display-message', '-p', '-t', `${session}:`, '#{window_activity}'], {
+      encoding: 'utf8',
+    })
+    const secs = Number((r.stdout ?? '').trim())
+    return r.status === 0 && secs > 0 ? secs * 1000 : null
+  }
+  // herdr: no output timestamp, but the agent status says whether it is busy.
+  const bin = existsSync('/opt/homebrew/bin/herdr') ? '/opt/homebrew/bin/herdr' : 'herdr'
+  const r = spawnSync(bin, ['pane', 'list'], { encoding: 'utf8' })
+  if (r.status !== 0) return null
+  try {
+    for (const p of JSON.parse(r.stdout ?? '{}')?.result?.panes ?? []) {
+      if (String(p?.label) === session && ['working', 'blocked'].includes(String(p?.agent_status))) {
+        return Date.now()
+      }
+    }
+  } catch {}
+  return null
+}
+
+function reapIdleSessions(): void {
+  const idleMs = IDLE_REAP_HOURS * 3600_000
+  const live = mux.liveSessions()
+  const now = Date.now()
+  let reaped = 0
+  for (const [topic, st] of topics) {
+    if (SQUARE_TOPIC && topic === SQUARE_TOPIC) continue
+    if (!st.session || st.spawning || !live.has(st.session)) continue
+    if (st.queue.length) continue // undelivered input: not idle, whatever the clocks say
+    if ([...pendingPerms.values()].some(p => p.topic === topic)) continue
+    const last = Math.max(lastTouch.get(topic) ?? 0, st.spawnedAt, paneActivityMs(st.session) ?? 0)
+    if (last === 0 || now - last < idleMs) continue // last===0: no signal at all, leave it be
+    const idleMin = Math.round((now - last) / 60_000)
+    const session = st.session
+    if (killSession(st, topic)) {
+      reaped++
+      log(`idle reaper: killed topic ${topic} "${st.name}" (${session}) after ${idleMin} min idle; will --resume on next message`)
+    } else {
+      log(`idle reaper: failed to kill topic ${topic} "${st.name}" (${session})`)
+    }
+  }
+  if (reaped) saveRegistry()
+}
+
+if (process.env.TELEGRAM_TOPICS_IDLE_REAP_HOURS) {
+  if (Number.isFinite(IDLE_REAP_HOURS) && IDLE_REAP_HOURS > 0) {
+    setInterval(reapIdleSessions, REAP_SCAN_MS)
+    log(`idle reaper enabled: topic sessions idle for ${IDLE_REAP_HOURS} h are killed (scan every ${REAP_SCAN_MS / 60_000} min)`)
+  } else {
+    log(`TELEGRAM_TOPICS_IDLE_REAP_HOURS="${process.env.TELEGRAM_TOPICS_IDLE_REAP_HOURS}" is not a number > 0; idle reaper disabled`)
+  }
+}
 
 // ---- nightly restart (passive) ---------------------------------------------
 //
