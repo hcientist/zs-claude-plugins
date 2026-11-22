@@ -74,6 +74,30 @@ TG_CLAUDE_BIN=$(command -v claude) || {
 }
 TG_PATH="$PATH"
 
+# PRE-RESUME TRANSCRIPT CHECK (2026-11-22 incident: topic 368 "Tandoor recipe
+# import mobile" died on every spawn). claude prunes transcripts older than
+# cleanupPeriodDays (default 30), so a long-idle topic's --resume fails with
+# "No conversation found". The screen-scrape self-heal in PANE_CMD below does
+# catch that, but only by launching claude a SECOND time, which shows the
+# trust + dev-channels dialogs all over again. With two independent answerers
+# (this launcher's watcher and the proxy's stuck-dialog scanner), a duplicate
+# answer to the FIRST launch's dev dialog can land as a stray Enter on the
+# SECOND launch's trust dialog, where "No, exit" is pre-selected, so claude quits
+# before writing a transcript and the topic is dead again. Avoid the failing
+# launch entirely: if the transcript is provably gone, do a first spawn
+# (--session-id + kickoff) from the start. Only skipped when we can SEE the
+# project dir but not the file; if the dir itself is missing our path
+# derivation may be off, so fall through to --resume + the self-heal fallback.
+# (proxy.ts makes the same check before it even sets TG_RESUME; this covers an
+# older proxy or a hand-run launch.)
+if [ -n "$TG_RESUME" ]; then
+  tg_project_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$TG_SPAWN_DIR" | sed 's/[^a-zA-Z0-9]/-/g')"
+  if [ -d "$tg_project_dir" ] && [ ! -e "$tg_project_dir/$TG_CLAUDE_SESSION_ID.jsonl" ]; then
+    echo "telegram-topics: transcript for $TG_CLAUDE_SESSION_ID is gone; starting it fresh instead of --resume" >&2
+    TG_RESUME=''
+  fi
+fi
+
 # The pane command, IDENTICAL for both backends. Runs under a shell INSIDE the
 # pane with the TG_*/TELEGRAM_* vars present in its environment (each backend
 # has its own way of getting them there - see spawn_tmux / spawn_herdr).
