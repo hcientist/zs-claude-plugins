@@ -91,12 +91,48 @@ loadEnvFile(join(STATE_DIR, '.env'))
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const GROUP_CHAT_ID = process.env.TELEGRAM_GROUP_CHAT_ID
 const SPAWN_DIR = process.env.TELEGRAM_TOPICS_SPAWN_DIR ?? homedir()
+
+// Where claude stores transcripts for sessions started in SPAWN_DIR
+// (~/.claude/projects/<cwd with every non-alphanumeric char -> '-'>).
+const TRANSCRIPT_DIR = join(
+  process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'),
+  'projects',
+  SPAWN_DIR.replace(/[^a-zA-Z0-9]/g, '-'),
+)
+
+// False only when we can positively tell the transcript is GONE (claude's
+// cleanupPeriodDays, default 30, deletes old ones; 2026-11-22 incident: topic
+// 368 crash-looped on `--resume` -> "No conversation found"). If the project
+// dir itself is missing we can't trust our path derivation, so assume it
+// exists and let --resume (plus launch-topic.sh's self-heal) handle it.
+function transcriptExists(sessionId: string): boolean {
+  if (!existsSync(TRANSCRIPT_DIR)) return true
+  return existsSync(join(TRANSCRIPT_DIR, `${sessionId}.jsonl`))
+}
 const PORT = parseInt(process.env.TELEGRAM_PROXY_PORT ?? '8790', 10)
 const MARKETPLACE = process.env.TELEGRAM_TOPICS_MARKETPLACE ?? 'plugin:telegram@zamua'
 const PROXY_URL = `http://localhost:${PORT}`
 
+// stderr is the tmux pane's pty. Once that pane is gone (tmux kill-session on
+// `systemctl stop`), every write fails with EIO; that error reached the
+// uncaughtException handler, which logged -> another EIO -> ... a hot loop that
+// pinned a core and starved the shutdown timer, so the proxy never exited and
+// kept holding the bot token + port (2026-11-22). Go silent instead.
+let stderrDead = false
+process.stderr.on('error', () => {
+  stderrDead = true
+})
+function isDeadStreamError(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code
+  return code === 'EIO' || code === 'EPIPE'
+}
 function log(m: string): void {
-  process.stderr.write(`${new Date().toISOString()} telegram-topics-proxy: ${m}\n`)
+  if (stderrDead) return
+  try {
+    process.stderr.write(`${new Date().toISOString()} telegram-topics-proxy: ${m}\n`)
+  } catch {
+    stderrDead = true
+  }
 }
 
 // ---- effort (ultracode) ----------------------------------------------------
@@ -231,6 +267,10 @@ process.on('unhandledRejection', err => {
   log(`unhandled rejection: ${err}`)
 })
 process.on('uncaughtException', err => {
+  if (isDeadStreamError(err)) {
+    stderrDead = true
+    return
+  }
   log(`uncaught exception: ${err}`)
 })
 
@@ -1317,6 +1357,12 @@ function ensureSession(topic: string): void {
     // the kickoff). Every later spawn RESUMES that same id (no kickoff), so the
     // topic stays one continuous conversation. The id is persisted in the
     // registry, so it survives proxy restarts too.
+    if (st.claudeSessionId && !transcriptExists(st.claudeSessionId)) {
+      // Transcript was pruned by claude: --resume would fail every time. Start
+      // a fresh conversation (new id) as if this were a first spawn.
+      log(`topic ${topic} "${label}": transcript for claude session ${st.claudeSessionId} is gone; starting a fresh session`)
+      st.claudeSessionId = undefined
+    }
     const resuming = !!st.claudeSessionId
     if (!st.claudeSessionId) st.claudeSessionId = crypto.randomUUID()
     // Name the tmux session from the CURRENT label (fresh each spawn, so a rename
@@ -1728,13 +1774,14 @@ let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
+  // bot.stop() signals the poll loop to end; the current getUpdates request may
+  // take up to its long-poll timeout to return. Force-exit after 2s. Armed
+  // FIRST so nothing below (e.g. logging to a dead pty) can skip it.
+  setTimeout(() => process.exit(0), 2000)
   log('shutting down')
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
-  // bot.stop() signals the poll loop to end; the current getUpdates request may
-  // take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
 process.on('SIGTERM', shutdown)
