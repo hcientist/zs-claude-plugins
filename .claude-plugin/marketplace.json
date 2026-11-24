@@ -14,6 +14,11 @@
       "name": "telegram",
       "source": "./plugins/telegram",
       "description": "Telegram forum-topics channel: multiplex ONE bot token across MANY concurrent Claude sessions, one foreground Claude per Telegram topic, via a local proxy. Drop-in for the single-session telegram channel."
+    },
+    {
+      "name": "matrix",
+      "source": "./plugins/matrix",
+      "description": "Matrix rooms channel: one bot account multiplexed across many Claude sessions, one per Matrix room, via a local proxy. Allowlisted senders only."
     }
   ]
 }

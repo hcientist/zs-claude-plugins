@@ -1,0 +1,15 @@
+{
+  "_comment": "Passed via --settings by scripts/launch-room.sh. The Stop hook (hooks/stop-reply-guard.py, path in $MX_HOOK) blocks a turn that answered a Matrix message without calling the reply tool, once per turn.",
+  "permissions": {
+    "allow": [
+      "mcp__plugin_matrix_matrix__reply",
+      "mcp__plugin_matrix_matrix__react",
+      "mcp__plugin_matrix_matrix__edit_message",
+      "mcp__plugin_matrix_matrix__download_attachment",
+      "mcp__plugin_matrix_matrix__list_rooms"
+    ]
+  },
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "python3 \"$MX_HOOK\"" }] }]
+  }
+}
