@@ -1,0 +1,6 @@
+{
+  "name": "matrix",
+  "description": "Matrix rooms channel for Claude Code: one bot account multiplexed across many Claude sessions, one per Matrix room, via a local proxy. Allowlisted senders only.",
+  "version": "0.1.0",
+  "keywords": ["matrix", "messaging", "channel", "mcp", "rooms"]
+}
